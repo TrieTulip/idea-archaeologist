@@ -1,4 +1,4 @@
 interface:
   display_name: "灵感考古学家"
-  short_description: "从跨领域线索中挖掘知识关联、验证创意并沉淀可行动方案"
-  default_prompt: "用 $idea-archaeologist 探索这个问题，验证知识关联并给出下一步实验。"
+  short_description: "按任务复杂度挖掘知识关联、验证创意并沉淀可行动方案"
+  default_prompt: "用 $idea-archaeologist 探索这个问题，按需要选择深度并给出可验证的下一步。"

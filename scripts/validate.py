@@ -18,6 +18,7 @@ from typing import Iterable
 
 
 REQUIRED_FILES = ("ideas.md", "connections.md", "preferences.md", "evolution.md")
+V2_INDEX_FIELDS = ("类型", "详情路径", "关键词", "摘要")
 RECORD_HEADING = re.compile(r"^##\s+([A-Z]+-[^\s—]+)(?:\s+—.*)?\s*$")
 FIELD_LINE = re.compile(r"^-\s+\*\*(.+?)\*\*\s*[:：]\s*(.*?)\s*$")
 DATE_TEXT = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -184,6 +185,25 @@ def add_record_errors(record: Record, errors: list[str]) -> None:
     for field_name in duplicate_field:
         errors.append(
             f"{record.source}: {record.record_id} duplicates field {field_name.removesuffix('__DUPLICATE')}"
+        )
+
+
+def add_v2_detail_errors(record: Record, errors: list[str]) -> None:
+    add_record_errors(record, errors)
+    for field_name in ("当前版本", "版本历史"):
+        if not record.fields.get(field_name, "").strip():
+            errors.append(
+                f"{record.source}: {record.record_id} missing required field {field_name}"
+            )
+    current_version = record.fields.get("当前版本", "").strip()
+    history = record.fields.get("版本历史", "").strip()
+    if current_version and not current_version.isdigit():
+        errors.append(f"{record.source}: {record.record_id} invalid current version")
+    elif current_version and history and not re.search(
+        rf"(?<!\d){re.escape(current_version)}\s*\|", history
+    ):
+        errors.append(
+            f"{record.source}: {record.record_id} version history lacks current version {current_version}"
         )
 
 
@@ -369,7 +389,7 @@ def add_version_errors(records: list[Record], errors: list[str]) -> None:
         previous = version
 
 
-def validate(root: Path) -> tuple[list[str], list[str], dict[str, int]]:
+def validate_legacy(root: Path) -> tuple[list[str], list[str], dict[str, int]]:
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -406,14 +426,216 @@ def validate(root: Path) -> tuple[list[str], list[str], dict[str, int]]:
     return errors, warnings, counts
 
 
+def validate_v2(root: Path) -> tuple[list[str], list[str], dict[str, int]]:
+    """Validate the V2 index-first knowledge layout."""
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    for directory in ("ideas", "connections"):
+        if not (root / directory).is_dir():
+            errors.append(f"Missing required directory: {directory}/")
+    for filename in ("index.md", "preferences.md", "evolution.md"):
+        if not (root / filename).is_file():
+            errors.append(f"Missing required file: {filename}")
+    if errors:
+        return errors, warnings, {}
+
+    index_records = parse_records(root / "index.md")
+    seen_index_ids: dict[str, str] = {}
+    indexed: dict[str, str] = {}
+    linked_details: set[Path] = set()
+
+    for entry in index_records:
+        if entry.record_id in seen_index_ids:
+            errors.append(
+                f"index.md: duplicate index ID {entry.record_id} "
+                f"(also in {seen_index_ids[entry.record_id]})"
+            )
+        else:
+            seen_index_ids[entry.record_id] = "index.md"
+
+        for field_name in V2_INDEX_FIELDS:
+            if not entry.fields.get(field_name, "").strip():
+                errors.append(
+                    f"index.md: {entry.record_id} missing required index field {field_name}"
+                )
+
+        expected_kind = record_kind(entry.record_id)
+        declared_kind = (
+            "ideas"
+            if entry.fields.get("类型") == "创意"
+            else "connections"
+            if entry.fields.get("类型") == "关联"
+            else "unknown"
+        )
+        if declared_kind == "unknown":
+            errors.append(f"index.md: {entry.record_id} invalid index type")
+        elif expected_kind != declared_kind:
+            errors.append(
+                f"index.md: {entry.record_id} ID prefix does not match type {declared_kind}"
+            )
+
+        relative = entry.fields.get("详情路径", "").strip("` ")
+        if not relative:
+            continue
+        detail_path = (root / relative).resolve()
+        try:
+            detail_path.relative_to(root.resolve())
+        except ValueError:
+            errors.append(f"index.md: {entry.record_id} detail path escapes knowledge root")
+            continue
+        if detail_path.suffix != ".md":
+            errors.append(f"index.md: {entry.record_id} detail path must be Markdown")
+        if not detail_path.is_file():
+            errors.append(
+                f"index.md: {entry.record_id} missing detail file {relative}"
+            )
+            continue
+        if detail_path in linked_details:
+            errors.append(
+                f"index.md: {entry.record_id} reuses detail file {relative}"
+            )
+        linked_details.add(detail_path)
+        indexed[entry.record_id] = relative
+
+    detail_records: list[Record] = []
+    for category in ("ideas", "connections"):
+        for path in sorted((root / category).glob("*.md")):
+            if path.resolve() not in linked_details:
+                errors.append(f"{category}: unindexed detail file {path.name}")
+            records = parse_records(path)
+            if len(records) != 1:
+                errors.append(
+                    f"{category}/{path.name}: expected one V2 detail record, found {len(records)}"
+                )
+            for record in records:
+                detail_records.append(record)
+                indexed_path = indexed.get(record.record_id)
+                if indexed_path is None:
+                    errors.append(
+                        f"{category}/{path.name}: detail record {record.record_id} has no index entry"
+                    )
+                elif (root / indexed_path).resolve() != path.resolve():
+                    errors.append(
+                        f"{category}/{path.name}: detail record {record.record_id} "
+                        "does not match its indexed path"
+                    )
+
+    for record in detail_records:
+        add_v2_detail_errors(record, errors)
+    add_duplicate_errors(detail_records, errors, warnings)
+
+    preferences = parse_records(root / "preferences.md")
+    evolution = parse_records(root / "evolution.md")
+    for record in preferences + evolution:
+        add_record_errors(record, errors)
+    add_reference_errors(
+        [r for r in detail_records if record_kind(r) == "ideas"],
+        [r for r in detail_records if record_kind(r) == "connections"],
+        preferences,
+        errors,
+    )
+    add_version_errors(evolution, errors)
+
+    counts = {
+        "ideas": sum(record_kind(r) == "ideas" for r in detail_records),
+        "connections": sum(record_kind(r) == "connections" for r in detail_records),
+        "feedback": sum(record.record_id.startswith("FB-") for record in preferences),
+        "preferences": sum(record.record_id.startswith("PREF-") for record in preferences),
+        "evolution": len(evolution),
+        "indexed": len(index_records),
+    }
+    return errors, warnings, counts
+
+
+def validate(root: Path) -> tuple[list[str], list[str], dict[str, int]]:
+    if (root / "index.md").is_file() and (root / "ideas").is_dir():
+        return validate_v2(root)
+    return validate_legacy(root)
+
+
+def validate_skill(root: Path) -> tuple[list[str], list[str], dict[str, int]]:
+    """Validate the V2 Skill package and its index-first knowledge store."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    required_files = (
+        "SKILL.md",
+        "README.md",
+        "CHANGELOG.md",
+        "references/methodology.md",
+        "references/thinking-models.md",
+        "references/scoring-rules.md",
+        "references/interaction-rules.md",
+        "references/memory-protocol.md",
+        "knowledge/index.md",
+        "knowledge/preferences.md",
+        "knowledge/evolution.md",
+        "tests/test-cases.md",
+        "tests/quality-checklist.md",
+        "tests/expected-behaviors.md",
+        "tests/evaluation-results.md",
+        "scripts/validate.py",
+        "scripts/route_mode.py",
+    )
+    for relative in required_files:
+        if not (root / relative).is_file():
+            errors.append(f"Missing required Skill file: {relative}")
+
+    for relative in ("knowledge/ideas", "knowledge/connections"):
+        if not (root / relative).is_dir():
+            errors.append(f"Missing required Skill directory: {relative}/")
+
+    for legacy in ("knowledge/ideas.md", "knowledge/connections.md"):
+        if (root / legacy).exists():
+            errors.append(f"Legacy knowledge file still present: {legacy}")
+
+    skill_path = root / "SKILL.md"
+    if skill_path.is_file():
+        text = skill_path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        if len(lines) > 180:
+            errors.append(f"SKILL.md is too long for a progressive entry: {len(lines)} lines")
+        if not re.search(r"^---\s*$", text, re.MULTILINE):
+            errors.append("SKILL.md missing YAML frontmatter")
+        if not re.search(r"^name:\s*idea-archaeologist\s*$", text, re.MULTILINE):
+            errors.append("SKILL.md has invalid name")
+        if not re.search(r'^description:\s*Use when\b', text, re.MULTILINE | re.IGNORECASE):
+            errors.append("SKILL.md description must start with 'Use when'")
+        if not re.search(r'^  version:\s*"2\.0\.0"\s*$', text, re.MULTILINE):
+            errors.append("SKILL.md version must be 2.0.0")
+        for mode in ("MODE_QUICK", "MODE_STANDARD", "MODE_DEEP"):
+            if mode not in text:
+                errors.append(f"SKILL.md missing {mode}")
+        if "0.25N + 0.20R + 0.25V + 0.20F + 0.10E" not in text:
+            errors.append("SKILL.md missing the required score formula")
+
+        for relative in sorted(set(re.findall(r"\]\((references/[^)#]+)", text))):
+            if not (root / relative).is_file():
+                errors.append(f"SKILL.md broken reference path: {relative}")
+        if len(set(re.findall(r"\]\((references/[^)#]+)", text))) < 5:
+            errors.append("SKILL.md must route to all five V2 reference modules")
+
+    knowledge_errors, knowledge_warnings, counts = validate_v2(root / "knowledge")
+    errors.extend(knowledge_errors)
+    warnings.extend(knowledge_warnings)
+    return errors, warnings, counts
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Validate IDEA ARCHAEOLOGIST Markdown knowledge assets."
+        description="Validate IDEA ARCHAEOLOGIST V2 package or knowledge assets."
     )
-    parser.add_argument("knowledge_dir", type=Path)
+    parser.add_argument("knowledge_dir", nargs="?", type=Path)
+    parser.add_argument("--skill", type=Path, help="Validate a complete Skill package.")
     args = parser.parse_args()
 
-    errors, warnings, counts = validate(args.knowledge_dir.resolve())
+    if (args.knowledge_dir is None) == (args.skill is None):
+        parser.error("provide either a knowledge directory or --skill <directory>")
+
+    if args.skill is not None:
+        errors, warnings, counts = validate_skill(args.skill.resolve())
+    else:
+        errors, warnings, counts = validate(args.knowledge_dir.resolve())
     for warning in warnings:
         print(f"WARN: {warning}")
     for error in errors:
@@ -424,7 +646,8 @@ def main() -> int:
         return 1
 
     summary = ", ".join(f"{name}={count}" for name, count in counts.items())
-    print(f"PASS: knowledge assets valid ({summary})")
+    label = "skill package" if args.skill is not None else "knowledge assets"
+    print(f"PASS: {label} valid ({summary})")
     return 0
 
 
